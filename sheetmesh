@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+#
+# sheetmesh — a tiny service mesh across Sheeternetes workbooks.
+#
+# Each Sheeternetes cluster is a Google Sheet fronted by an Apps Script
+# apiserver. sheetmesh federates several of them into one mesh so you can do
+# cross-sheet service discovery: ask "who hosts service X?" and get back the
+# peer cluster(s) that run a Deployment with that name.
+#
+# Requires: bash, curl, jq.
+#
+# Peers live in ${SHEETMESH_HOME:-~/.sheetmesh}/peers.json as:
+#   { "peers": { "<name>": { "url": "...", "token": "..." }, ... } }
+#
+# Usage:
+#   sheetmesh peer add <name> <WEBAPP_URL> <TOKEN>   register a peer cluster
+#   sheetmesh peer list                              list registered peers
+#   sheetmesh peer remove <name>                     unregister a peer
+#   sheetmesh resolve <service> [--mock]             which cluster(s) host it
+#   sheetmesh services [--mock]                      all services + home cluster
+#
+# Smoke-testing without a live apiserver:
+#   Export SHEET_JSON_<peer>='{"items":[{"name":"web","image":"nginx","replicas":2}]}'
+#   (peer name upper-cased, non-alphanumerics -> _) to feed a peer a canned
+#   deployments response, or pass --mock to feed every peer a demo response.
+#
+set -euo pipefail
+
+SHEETMESH_HOME="${SHEETMESH_HOME:-$HOME/.sheetmesh}"
+PEERS_FILE="$SHEETMESH_HOME/peers.json"
+
+die() { echo "sheetmesh: $*" >&2; exit 1; }
+
+need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
+need curl
+need jq
+
+ensure_store() {
+  mkdir -p "$SHEETMESH_HOME"
+  [ -f "$PEERS_FILE" ] || echo '{"peers":{}}' > "$PEERS_FILE"
+}
+
+# Env var name that can override a peer's live response, e.g. SHEET_JSON_MY_PEER.
+env_var_for() {
+  local up
+  up="$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_')"
+  printf 'SHEET_JSON_%s' "$up"
+}
+
+MOCK_JSON='{"items":[{"name":"web","image":"nginx:latest","replicas":2},{"name":"api","image":"api:v1","replicas":3}]}'
+
+# Fetch a peer's deployments as JSON. Honours (in order): --mock, per-peer
+# SHEET_JSON_<peer> override, then the live apiserver.
+fetch_deployments() {
+  local name="$1" url="$2" token="$3" mock="$4" var val
+  if [ "$mock" = "1" ]; then
+    printf '%s' "$MOCK_JSON"; return 0
+  fi
+  var="$(env_var_for "$name")"
+  val="${!var:-}"
+  if [ -n "$val" ]; then
+    printf '%s' "$val"; return 0
+  fi
+  curl -fsSL -m 30 "${url}?token=${token}&kind=deployments"
+}
+
+cmd_peer() {
+  local sub="${1:-list}"; shift || true
+  case "$sub" in
+    add)
+      local name="${1:-}" url="${2:-}" token="${3:-}"
+      [ -n "$name" ] && [ -n "$url" ] && [ -n "$token" ] \
+        || die "usage: sheetmesh peer add <name> <WEBAPP_URL> <TOKEN>"
+      ensure_store
+      local tmp; tmp="$(mktemp)"
+      jq --arg n "$name" --arg u "$url" --arg t "$token" \
+        '.peers[$n] = {url:$u, token:$t}' "$PEERS_FILE" > "$tmp" \
+        && mv "$tmp" "$PEERS_FILE"
+      echo "peer '$name' registered ($url)"
+      ;;
+    list|ls)
+      ensure_store
+      local n
+      n="$(jq -r '.peers | length' "$PEERS_FILE")"
+      if [ "$n" = "0" ]; then
+        echo "no peers registered. add one: sheetmesh peer add <name> <url> <token>"
+        return 0
+      fi
+      { echo -e "NAME\tWEBAPP_URL"
+        jq -r '.peers | to_entries[] | [.key, .value.url] | @tsv' "$PEERS_FILE"
+      } | column -t -s $'\t'
+      ;;
+    remove|rm|delete)
+      local name="${1:-}"
+      [ -n "$name" ] || die "usage: sheetmesh peer remove <name>"
+      ensure_store
+      jq -e --arg n "$name" '.peers | has($n)' "$PEERS_FILE" >/dev/null \
+        || die "no such peer: $name"
+      local tmp; tmp="$(mktemp)"
+      jq --arg n "$name" 'del(.peers[$n])' "$PEERS_FILE" > "$tmp" \
+        && mv "$tmp" "$PEERS_FILE"
+      echo "peer '$name' removed"
+      ;;
+    *)
+      die "unknown peer subcommand: $sub (add|list|remove)"
+      ;;
+  esac
+}
+
+# Iterate peers, invoking `handler <name> <url> <token> <json>` for each one
+# that returns a usable deployments response. Skips unreachable peers.
+for_each_peer() {
+  local mock="$1" handler="$2"
+  ensure_store
+  local n
+  n="$(jq -r '.peers | length' "$PEERS_FILE")"
+  [ "$n" = "0" ] && die "no peers registered. add one with: sheetmesh peer add"
+  local name url token json
+  while IFS=$'\t' read -r name url token; do
+    [ -n "$name" ] || continue
+    if json="$(fetch_deployments "$name" "$url" "$token" "$mock" 2>/dev/null)" \
+        && printf '%s' "$json" | jq -e '.items' >/dev/null 2>&1; then
+      "$handler" "$name" "$url" "$token" "$json"
+    else
+      echo "sheetmesh: warning: peer '$name' unreachable, skipping" >&2
+    fi
+  done < <(jq -r '.peers | to_entries[] | [.key, .value.url, .value.token] | @tsv' "$PEERS_FILE")
+}
+
+RESOLVE_SVC=""
+cmd_resolve() {
+  local service="" mock=0 a
+  for a in "$@"; do
+    case "$a" in
+      --mock) mock=1 ;;
+      *) [ -z "$service" ] && service="$a" || die "unexpected arg: $a" ;;
+    esac
+  done
+  [ -n "$service" ] || die "usage: sheetmesh resolve <service> [--mock]"
+  RESOLVE_SVC="$service"
+
+  local rows; rows="$(mktemp)"
+  _resolve_one() {
+    local name="$1" json="$4"
+    printf '%s' "$json" | jq -r --arg s "$RESOLVE_SVC" --arg c "$name" \
+      '.items[] | select(.name == $s) | [$s, $c, (.replicas|tostring), .image] | @tsv'
+  }
+  for_each_peer "$mock" _resolve_one > "$rows"
+
+  { echo -e "SERVICE\tCLUSTER\tREPLICAS\tIMAGE"; cat "$rows"; } | column -t -s $'\t'
+  if [ ! -s "$rows" ]; then
+    rm -f "$rows"
+    echo "sheetmesh: service '$service' not found on any peer" >&2
+    return 1
+  fi
+  rm -f "$rows"
+}
+
+cmd_services() {
+  local mock=0 a
+  for a in "$@"; do
+    case "$a" in
+      --mock) mock=1 ;;
+      *) die "unexpected arg: $a" ;;
+    esac
+  done
+  _services_one() {
+    local name="$1" json="$4"
+    printf '%s' "$json" | jq -r --arg c "$name" \
+      '.items[] | [.name, $c, (.replicas|tostring), .image] | @tsv'
+  }
+  { echo -e "SERVICE\tHOME_CLUSTER\tREPLICAS\tIMAGE"
+    for_each_peer "$mock" _services_one
+  } | column -t -s $'\t'
+}
+
+usage() { grep '^#' "$0" | sed 's/^# \{0,1\}//'; }
+
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    peer)     cmd_peer "$@" ;;
+    resolve)  cmd_resolve "$@" ;;
+    services) cmd_services "$@" ;;
+    help|-h|--help) usage ;;
+    *) usage; die "unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"

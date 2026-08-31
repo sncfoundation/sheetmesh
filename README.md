@@ -15,6 +15,48 @@ A <a href="https://sncfoundation.github.io">Sheet-Native Computing Foundation</a
 
 Federate spreadsheets into one service mesh Part of the spreadsheet-native stack — the Sheet stays the source of truth, and it reconciles.
 
+## Usage
+
+`sheetmesh` is a small bash CLI that federates several Sheeternetes clusters —
+each one a Google Sheet fronted by an Apps Script apiserver — into a single
+mesh. It gives you cross-sheet service discovery: register your workbooks as
+peers, then ask which cluster(s) host a given Deployment.
+
+Requires `bash`, `curl`, and `jq`. Peers are stored in
+`${SHEETMESH_HOME:-~/.sheetmesh}/peers.json`.
+
+```bash
+# Register peer clusters (name, Apps Script /exec URL, token)
+sheetmesh peer add prod https://script.google.com/macros/s/AAAA/exec s3cr3t
+sheetmesh peer add edge https://script.google.com/macros/s/BBBB/exec h0tdog
+
+# List / remove peers
+sheetmesh peer list
+sheetmesh peer remove edge
+
+# Cross-sheet service discovery: which cluster(s) host a Deployment?
+sheetmesh resolve web
+# SERVICE  CLUSTER  REPLICAS  IMAGE
+# web      prod     3         nginx:latest
+# web      edge     1         caddy
+
+# List every service across the mesh with its home cluster
+sheetmesh services
+```
+
+### Smoke-testing without a live apiserver
+
+Pass `--mock` to feed every peer a canned deployments response, or export a
+`SHEET_JSON_<PEER>` variable (peer name upper-cased, non-alphanumerics `->` `_`)
+to stub a single peer:
+
+```bash
+sheetmesh resolve web --mock
+
+export SHEET_JSON_PROD='{"items":[{"name":"web","image":"nginx","replicas":3}]}'
+sheetmesh resolve web
+```
+
 ## Get involved
 
 - 📋 Tracking issue &amp; design: [sncfoundation/sheeternetes#6](https://github.com/sncfoundation/sheeternetes/issues/6)
