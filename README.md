@@ -9,7 +9,7 @@ A <a href="https://sncfoundation.github.io">Sheet-Native Computing Foundation</a
 
 ---
 
-**Status:** 📝 Unsaved Draft &#183; this project is a proposal. Design notes and contributions are welcome.
+**Status:** 💾 Autosaving &#183; promoted from Unsaved Draft. Working code, released as [v0.1.0](https://github.com/sncfoundation/sheetmesh/releases/tag/v0.1.0), and the [tracking issue #6](https://github.com/sncfoundation/sheeternetes/issues/6) is closed. Google keeps saving it.
 
 ## About
 
@@ -59,7 +59,7 @@ sheetmesh resolve web
 
 ## Get involved
 
-- 📋 Tracking issue &amp; design: [sncfoundation/sheeternetes#6](https://github.com/sncfoundation/sheeternetes/issues/6)
+- 📋 Tracking issue &amp; design: [sncfoundation/sheeternetes#6](https://github.com/sncfoundation/sheeternetes/issues/6) (closed)
 - 🗺️ [SNCF Landscape](https://sncfoundation.github.io/landscape.html)
 - 🧩 [All projects](https://sncfoundation.github.io/projects.html)
 - ⚖️ [Governance &amp; how to contribute](https://github.com/sncfoundation/governance)
